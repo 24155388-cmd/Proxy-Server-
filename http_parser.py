@@ -3,4 +3,15 @@ def parse_request(data):
 
     method, target, version = lines[0].split()
 
-    return method, target, version
+    headers = {}
+
+    for line in lines[1:]:
+        if not line:
+            break
+
+        key, value = line.split(":", 1)
+        headers[key.lower()] = value.strip()
+
+    return method, target, version, headers
+
+    
