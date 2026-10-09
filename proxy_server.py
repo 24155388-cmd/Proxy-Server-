@@ -1,8 +1,11 @@
+
 import socket
 import threading
 
 import config
+from cache_manager import LRUCache
 from connection_handler import handle_client
+
 
 class ProxyServer:
 
@@ -11,9 +14,21 @@ class ProxyServer:
         self.port = port
         self.running = False
 
+        self.cache = LRUCache(
+            max_entries=config.CACHE_MAX_ENTRIES,
+            default_ttl=config.CACHE_DEFAULT_TTL,
+        )
+
     def start(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        )
+        server_socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1
+        )
 
         server_socket.bind((self.host, self.port))
         server_socket.listen(50)
@@ -22,15 +37,26 @@ class ProxyServer:
 
         print(f"Proxy listening on {self.host}:{self.port}")
 
-        while self.running:
-            client_socket, client_addr = server_socket.accept()
+        try:
+            while self.running:
+                client_socket, client_addr = server_socket.accept()
 
-            thread = threading.Thread(
-                target=handle_client,
-                args=(client_socket, client_addr),
-                daemon=True
-            )
-            thread.start()
+                print(f"Accepted connection from {client_addr}")
+
+                thread = threading.Thread(
+                    target=handle_client,
+                    args=(client_socket, client_addr, self.cache),
+                    daemon=True
+                )
+                thread.start()
+
+        except KeyboardInterrupt:
+            print("\nStopping proxy server...")
+
+        finally:
+            self.running = False
+            server_socket.close()
+
 
 if __name__ == "__main__":
     server = ProxyServer()
