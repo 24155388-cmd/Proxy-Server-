@@ -168,9 +168,32 @@ def handle_client(client_socket, client_addr, cache):
             return
 
         # Connect to the origin server.
-        server_socket = socket.create_connection(
-            (host, port), timeout=10
-        )
+        # Handle connection timeouts separately from other failures.
+        try:
+            server_socket = socket.create_connection(
+                (host, port), timeout=10
+            )
+        except socket.timeout as error:
+            print(
+                f"Upstream connection timed out for {host}:{port}: "
+                f"{error}"
+            )
+            client_socket.sendall(
+                b"HTTP/1.1 504 Gateway Timeout\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
+        except OSError as error:
+            print(
+                f"Upstream connection failed for {host}:{port}: "
+                f"{type(error).__name__}: {error}"
+            )
+            client_socket.sendall(
+                b"HTTP/1.1 502 Bad Gateway\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
+
         server_socket.settimeout(10)
 
         forwarded_request = build_origin_request(
