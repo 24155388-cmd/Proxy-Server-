@@ -1,6 +1,6 @@
-
 import socket
 import select
+
 from access_control import is_blocked
 
 from http_parser import (
@@ -14,23 +14,27 @@ def tunnel(client_socket, server_socket):
     sockets = [client_socket, server_socket]
 
     while True:
-        readable, _, _ = select.select(sockets, [], [])
+        try:
+            readable, _, _ = select.select(sockets, [], [])
+        except (OSError, ValueError):
+            return
 
         for sock in readable:
             try:
                 data = sock.recv(4096)
-            except (ConnectionAbortedError, ConnectionResetError):
+            except (ConnectionAbortedError, ConnectionResetError, OSError):
                 return
 
             if not data:
                 return
 
+            other = (
+                server_socket
+                if sock is client_socket
+                else client_socket
+            )
+
             try:
-                other = (
-                    server_socket
-                    if sock is client_socket
-                    else client_socket
-                )
                 other.sendall(data)
             except (ConnectionAbortedError, ConnectionResetError, OSError):
                 return
@@ -45,20 +49,46 @@ def handle_client(client_socket, client_addr, cache):
         if not data:
             return
 
-        try:
-            method, target, version, headers = parse_request(data)
-        except (ValueError, IndexError):
+        # Parse the request and reject malformed input.
+        parsed_request = parse_request(data)
+
+        if parsed_request is None:
             client_socket.sendall(
                 b"HTTP/1.1 400 Bad Request\r\n"
                 b"Connection: close\r\n\r\n"
             )
             return
 
+        method, target, version, headers = parsed_request
+
         print(f"{client_addr} -> {method} {target}")
 
-        # HTTPS: keep using the existing CONNECT tunnel.
+        # Handle HTTPS CONNECT requests.
         if method == "CONNECT":
-            host, port = target.rsplit(":", 1)
+            if ":" not in target:
+                client_socket.sendall(
+                    b"HTTP/1.1 400 Bad Request\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                return
+
+            host, port_text = target.rsplit(":", 1)
+
+            if not port_text.isdigit():
+                client_socket.sendall(
+                    b"HTTP/1.1 400 Bad Request\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                return
+
+            port = int(port_text)
+
+            if not 1 <= port <= 65535:
+                client_socket.sendall(
+                    b"HTTP/1.1 400 Bad Request\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                return
 
             if is_blocked(host):
                 print(f"BLOCKED: {host}")
@@ -69,9 +99,9 @@ def handle_client(client_socket, client_addr, cache):
                 return
 
             server_socket = socket.create_connection(
-                (host, int(port)), timeout=10
+                (host, port), timeout=10
             )
-            
+
             client_socket.sendall(
                 b"HTTP/1.1 200 Connection Established\r\n\r\n"
             )
@@ -79,6 +109,7 @@ def handle_client(client_socket, client_addr, cache):
             tunnel(client_socket, server_socket)
             return
 
+        # Check the Host header for ordinary HTTP requests.
         host_header = headers.get("host")
 
         if not host_header:
@@ -92,6 +123,7 @@ def handle_client(client_socket, client_addr, cache):
 
         if ":" in blocked_host:
             possible_host, possible_port = blocked_host.rsplit(":", 1)
+
             if possible_port.isdigit():
                 blocked_host = possible_host
 
@@ -101,12 +133,12 @@ def handle_client(client_socket, client_addr, cache):
                 b"HTTP/1.1 403 Forbidden\r\n"
                 b"Connection: close\r\n\r\n"
             )
-            return  
+            return
 
-        # Include the host in the key to avoid URL collisions.
+        # Include the host in the cache key.
         cache_key = f"{host_header.lower()}|{target}"
 
-        # Only GET requests are eligible for lookup.
+        # Only GET requests are eligible for cache lookup.
         if method == "GET":
             cached_response = cache.get(cache_key)
 
@@ -117,16 +149,25 @@ def handle_client(client_socket, client_addr, cache):
 
             print(f"CACHE MISS: {target}")
 
-        # Requests other than GET bypass the cache.
+        # Determine the upstream host and port.
         host = host_header
         port = 80
 
         if ":" in host_header:
-            host, port_text = host_header.rsplit(":", 1)
+            possible_host, port_text = host_header.rsplit(":", 1)
 
             if port_text.isdigit():
+                host = possible_host
                 port = int(port_text)
 
+        if not 1 <= port <= 65535:
+            client_socket.sendall(
+                b"HTTP/1.1 400 Bad Request\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
+
+        # Connect to the origin server.
         server_socket = socket.create_connection(
             (host, port), timeout=10
         )
@@ -144,7 +185,6 @@ def handle_client(client_socket, client_addr, cache):
             try:
                 chunk = server_socket.recv(4096)
             except socket.timeout:
-                # Do not cache a potentially incomplete response.
                 client_socket.sendall(
                     b"HTTP/1.1 504 Gateway Timeout\r\n"
                     b"Connection: close\r\n\r\n"
@@ -161,7 +201,7 @@ def handle_client(client_socket, client_addr, cache):
         if not response:
             return
 
-        # Store eligible GET responses.
+        # Store eligible GET responses in the cache.
         if method == "GET":
             ttl = get_cache_ttl(response)
 
@@ -172,7 +212,10 @@ def handle_client(client_socket, client_addr, cache):
         client_socket.sendall(response)
 
     except (OSError, ValueError, IndexError) as error:
-        print(f"Proxy error for {client_addr}: {error}")
+        print(
+            f"Proxy error for {client_addr}: "
+            f"{type(error).__name__}: {error}"
+        )
 
         try:
             client_socket.sendall(
@@ -184,6 +227,12 @@ def handle_client(client_socket, client_addr, cache):
 
     finally:
         if server_socket is not None:
-            server_socket.close()
+            try:
+                server_socket.close()
+            except OSError:
+                pass
 
-        client_socket.close()
+        try:
+            client_socket.close()
+        except OSError:
+            pass

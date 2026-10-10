@@ -1,21 +1,51 @@
-def parse_request(data):
-    lines = data.decode(errors="ignore").split("\r\n")
-
-    method, target, version = lines[0].split()
-
-    headers = {}
-
-    for line in lines[1:]:
-        if not line:
-            break
-
-        key, value = line.split(":", 1)
-        headers[key.lower()] = value.strip()
-
-    return method, target, version, headers
-
-
 from urllib.parse import urlsplit
+
+
+def parse_request(data):
+    """Parse an HTTP request and reject malformed request lines or headers."""
+    try:
+        lines = data.decode("iso-8859-1").split("\r\n")
+
+        if not lines or not lines[0].strip():
+            return None
+
+        parts = lines[0].split()
+
+        if len(parts) != 3:
+            return None
+
+        method, target, version = parts
+
+        if not method.isalpha():
+            return None
+
+        if version not in ("HTTP/1.0", "HTTP/1.1"):
+            return None
+
+        headers = {}
+
+        for line in lines[1:]:
+            if not line:
+                break
+
+            if ":" not in line:
+                return None
+
+            key, value = line.split(":", 1)
+            key = key.strip()
+
+            if not key or any(
+                not (char.isalnum() or char == "-") for char in key
+            ):
+                return None
+
+            headers[key.lower()] = value.strip()
+
+        return method.upper(), target, version, headers
+
+    except (ValueError, UnicodeError):
+        return None
+
 
 def build_origin_request(data, method, target, version, headers):
     """Build an HTTP request suitable for the origin server."""
@@ -26,12 +56,10 @@ def build_origin_request(data, method, target, version, headers):
         if parsed.query:
             target += "?" + parsed.query
 
-    lines = [
-        f"{method} {target} {version}"
-    ]
+    lines = [f"{method} {target} {version}"]
 
     for key, value in headers.items():
-        if key != "connection":
+        if key.lower() != "connection":
             lines.append(f"{key}: {value}")
 
     lines.append("Connection: close")
@@ -89,6 +117,3 @@ def get_cache_ttl(response):
                 return None
 
     return 300
-
-
-    
