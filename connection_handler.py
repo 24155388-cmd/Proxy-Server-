@@ -45,7 +45,14 @@ def handle_client(client_socket, client_addr, cache):
         if not data:
             return
 
-        method, target, version, headers = parse_request(data)
+        try:
+            method, target, version, headers = parse_request(data)
+        except (ValueError, IndexError):
+            client_socket.sendall(
+                b"HTTP/1.1 400 Bad Request\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return
 
         print(f"{client_addr} -> {method} {target}")
 
