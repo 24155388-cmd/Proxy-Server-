@@ -1,0 +1,5 @@
+#
+
+# One domain per line
+
+example.com

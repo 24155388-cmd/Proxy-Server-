@@ -1,6 +1,7 @@
 
 import socket
 import select
+from access_control import is_blocked
 
 from http_parser import (
     parse_request,
@@ -52,10 +53,18 @@ def handle_client(client_socket, client_addr, cache):
         if method == "CONNECT":
             host, port = target.rsplit(":", 1)
 
+            if is_blocked(host):
+                print(f"BLOCKED: {host}")
+                client_socket.sendall(
+                    b"HTTP/1.1 403 Forbidden\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                return
+
             server_socket = socket.create_connection(
                 (host, int(port)), timeout=10
             )
-
+            
             client_socket.sendall(
                 b"HTTP/1.1 200 Connection Established\r\n\r\n"
             )
@@ -71,6 +80,21 @@ def handle_client(client_socket, client_addr, cache):
                 b"Connection: close\r\n\r\n"
             )
             return
+
+        blocked_host = host_header
+
+        if ":" in blocked_host:
+            possible_host, possible_port = blocked_host.rsplit(":", 1)
+            if possible_port.isdigit():
+                blocked_host = possible_host
+
+        if is_blocked(blocked_host):
+            print(f"BLOCKED: {blocked_host}")
+            client_socket.sendall(
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            return  
 
         # Include the host in the key to avoid URL collisions.
         cache_key = f"{host_header.lower()}|{target}"
