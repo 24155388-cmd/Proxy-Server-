@@ -1,3 +1,4 @@
+
 import socket
 import select
 
@@ -10,7 +11,140 @@ from http_parser import (
 )
 
 
+MAX_HEADER_SIZE = 64 * 1024       # 64 KiB
+MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MiB
+CLIENT_READ_TIMEOUT = 10           # Seconds
+
+
+def read_client_request(client_socket):
+    """
+    Read one complete HTTP request.
+
+    Supports headers followed by a body framed using Content-Length.
+    Chunked request bodies are explicitly rejected because they are
+    not decoded or forwarded by this implementation.
+
+    Returns:
+        (request_bytes, None) on success.
+        (None, HTTP_status_code) on a request-reading error.
+        (b"", None) if the client closes without sending data.
+    """
+    data = bytearray()
+    separator = b"\r\n\r\n"
+
+    original_timeout = client_socket.gettimeout()
+    client_socket.settimeout(CLIENT_READ_TIMEOUT)
+
+    try:
+        # Read until the entire HTTP header section arrives.
+        while separator not in data:
+            try:
+                chunk = client_socket.recv(4096)
+            except socket.timeout:
+                return None, 408
+
+            if not chunk:
+                if not data:
+                    return b"", None
+                return None, 400
+
+            data.extend(chunk)
+
+            if separator not in data and len(data) > MAX_HEADER_SIZE:
+                return None, 431
+
+        header_end = data.index(separator) + len(separator)
+
+        if header_end > MAX_HEADER_SIZE:
+            return None, 431
+
+        # Inspect framing headers without modifying the original request.
+        header_text = bytes(data[:header_end]).decode("iso-8859-1")
+        header_lines = header_text.split("\r\n")
+        framing_headers = {}
+
+        for line in header_lines[1:]:
+            if not line:
+                break
+
+            if ":" not in line:
+                return None, 400
+
+            name, value = line.split(":", 1)
+            name = name.strip().lower()
+            value = value.strip()
+
+            if not name:
+                return None, 400
+
+            # Conflicting Content-Length or Transfer-Encoding values
+            # can lead to ambiguous request framing, so reject them.
+            if name in ("content-length", "transfer-encoding"):
+                if (
+                    name in framing_headers
+                    and framing_headers[name] != value
+                ):
+                    return None, 400
+
+                framing_headers[name] = value
+
+        # Reject ambiguous framing when both headers are present.
+        if (
+            "content-length" in framing_headers
+            and "transfer-encoding" in framing_headers
+        ):
+            return None, 400
+
+        # Chunked request bodies are not supported in this version.
+        if "transfer-encoding" in framing_headers:
+            return None, 501
+
+        content_length_text = framing_headers.get("content-length", "0")
+
+        if not content_length_text or not all(
+            "0" <= char <= "9" for char in content_length_text
+        ):
+            return None, 400
+
+        try:
+            content_length = int(content_length_text)
+        except ValueError:
+            return None, 400
+
+        if content_length > MAX_BODY_SIZE:
+            return None, 413
+
+        expected_length = header_end + content_length
+
+        # Continue reading until the complete declared body arrives.
+        while len(data) < expected_length:
+            try:
+                chunk = client_socket.recv(4096)
+            except socket.timeout:
+                return None, 408
+
+            if not chunk:
+                # The client closed the connection before the
+                # declared body was completely received.
+                return None, 400
+
+            data.extend(chunk)
+
+        # This handler processes one request per connection. Ignore
+        # any bytes beyond this request's declared body.
+        return bytes(data[:expected_length]), None
+
+    finally:
+        # Restore the socket's original timeout. In particular, this
+        # prevents the request-reading timeout from affecting CONNECT.
+        try:
+            client_socket.settimeout(original_timeout)
+        except OSError:
+            pass
+
+
 def tunnel(client_socket, server_socket):
+    """Relay bytes between a client and an upstream server."""
     sockets = [client_socket, server_socket]
 
     while True:
@@ -41,15 +175,36 @@ def tunnel(client_socket, server_socket):
 
 
 def handle_client(client_socket, client_addr, cache):
+    """Handle one client request and close the connection safely."""
     server_socket = None
 
     try:
-        data = client_socket.recv(4096)
+        # Read a complete request instead of assuming one recv()
+        # contains the entire request.
+        data, read_error = read_client_request(client_socket)
+
+        if read_error is not None:
+            reasons = {
+                400: "Bad Request",
+                408: "Request Timeout",
+                413: "Payload Too Large",
+                431: "Request Header Fields Too Large",
+                501: "Not Implemented",
+            }
+
+            reason = reasons[read_error]
+
+            client_socket.sendall(
+                f"HTTP/1.1 {read_error} {reason}\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n\r\n".encode("ascii")
+            )
+            return
 
         if not data:
             return
 
-        # Parse the request and reject malformed input.
+        # Parse the complete request and reject malformed input.
         parsed_request = parse_request(data)
 
         if parsed_request is None:
@@ -98,9 +253,30 @@ def handle_client(client_socket, client_addr, cache):
                 )
                 return
 
-            server_socket = socket.create_connection(
-                (host, port), timeout=10
-            )
+            try:
+                server_socket = socket.create_connection(
+                    (host, port), timeout=10
+                )
+            except socket.timeout as error:
+                print(
+                    f"Upstream connection timed out for {host}:{port}: "
+                    f"{error}"
+                )
+                client_socket.sendall(
+                    b"HTTP/1.1 504 Gateway Timeout\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                return
+            except OSError as error:
+                print(
+                    f"Upstream connection failed for {host}:{port}: "
+                    f"{type(error).__name__}: {error}"
+                )
+                client_socket.sendall(
+                    b"HTTP/1.1 502 Bad Gateway\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                return
 
             client_socket.sendall(
                 b"HTTP/1.1 200 Connection Established\r\n\r\n"
@@ -168,7 +344,6 @@ def handle_client(client_socket, client_addr, cache):
             return
 
         # Connect to the origin server.
-        # Handle connection timeouts separately from other failures.
         try:
             server_socket = socket.create_connection(
                 (host, port), timeout=10
@@ -201,7 +376,8 @@ def handle_client(client_socket, client_addr, cache):
         )
         server_socket.sendall(forwarded_request)
 
-        # Read the response until the origin closes the connection.
+        # Read the upstream response until the origin closes the
+        # connection, as in the original implementation.
         response_parts = []
 
         while True:
