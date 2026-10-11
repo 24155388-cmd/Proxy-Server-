@@ -145,13 +145,18 @@ On a valid lookup, the entry is moved to the end of the ordered dictionary to ma
 1. The response status is `200`.
 2. The response does not contain `Set-Cookie`.
 3. The `Cache-Control` directives do not include `private`, `no-store`, or `no-cache`.
-4. The response has a positive TTL. A numeric `max-age` directive is used when present; otherwise the default lifetime of 300 seconds is used.
+4. The request has no `Cookie` or `Authorization` header, and the response has no `Set-Cookie` or `Vary` header.
+5. The response has a positive TTL. A numeric `max-age` directive is used when present; otherwise the default lifetime of 300 seconds is used.
 
-Responses with a non-200 status or a non-positive TTL are not inserted. Cache hits return the stored response bytes without contacting the origin.
+Requests carrying `Cookie` or `Authorization` bypass the shared cache, preventing a cached personalized response from being reused across clients. Responses with a non-200 status, a non-positive TTL, or the excluded headers/directives are not inserted. Cache hits return the stored response bytes without contacting the origin.
 
-### 5.4 Design trade-offs
+### 5.4 Cache-leak vulnerability and fix
 
-LRU keeps frequently reused entries while bounding the number stored. TTL prevents an entry from being served indefinitely. The implementation deliberately remains small, but it is not a complete HTTP caching implementation: it does not perform ETag/`If-None-Match` revalidation, does not persist entries to disk, and does not implement the full `Vary` request-header semantics.
+The earlier shared-cache policy used the host and request target as its key, without accounting for client cookies or authorization. Two clients requesting the same URL could therefore receive the same cached response, potentially exposing personalized content. The fix is to bypass cache lookup/storage for requests containing `Cookie` or `Authorization`, and to reject responses containing `Set-Cookie` or `Vary` or marked `private`, `no-store`, or `no-cache`. This conservative policy reduces cross-client leakage risk; it does not make the proxy a complete HTTP cache.
+
+### 5.5 Design trade-offs
+
+LRU keeps frequently reused entries while bounding the number stored. TTL prevents an entry from being served indefinitely. The implementation deliberately remains small: it does not perform ETag/`If-None-Match` revalidation, persist entries to disk, or implement the full `Vary` request-header semantics. Responses with `Vary` are excluded instead.
 
 ## 6. Domain-based access control
 
@@ -238,7 +243,7 @@ The hit latency in this particular local benchmark is close to the miss latency.
 |---|---|
 | One request per connection; no persistent keep-alive | Add correct multi-request connection handling and lifecycle management. |
 | Chunked request bodies are rejected | Implement and test HTTP transfer-coding parsing safely. |
-| Cache does not implement all HTTP caching semantics | Add `Vary`, ETag/conditional revalidation, and more complete directive handling. |
+| Cache does not implement all HTTP caching semantics | Add safe `Vary`-aware caching, ETag/conditional revalidation, and more complete directive handling. |
 | Cache is memory-only and uses an entry-count limit | Add optional disk-backed storage or a byte-size limit. |
 | No IP-based rate limiting or proxy authentication | Add explicit, tested access-control policies if required by the assignment. |
 | No wildcard blacklist matching | Add a defined wildcard syntax and tests only if that behavior is needed. |

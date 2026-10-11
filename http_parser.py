@@ -94,7 +94,8 @@ def get_cache_ttl(response):
             key = key.lower().strip()
             headers[key] = headers.get(key, "") + "," + value.strip()
 
-    if "set-cookie" in headers:
+    # Do not cache responses that set cookies or vary by request headers.
+    if "set-cookie" in headers or "vary" in headers:
         return None
 
     cache_control = headers.get("cache-control", "").lower()

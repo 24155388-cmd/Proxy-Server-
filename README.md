@@ -11,7 +11,7 @@ This documentation describes the implementation in the submitted source files. I
 | HTTP forwarding | Parses an HTTP request, connects to the destination, forwards the request, and returns the origin response. |
 | HTTPS support | Handles `CONNECT` and relays bytes in both directions through a TCP tunnel. The proxy does not decrypt TLS traffic. |
 | Response cache | Thread-safe, in-memory LRU cache with a configurable maximum of 100 entries and a default TTL of 300 seconds. |
-| Cache rules | Only `GET` responses with status `200` are considered. Responses containing `Set-Cookie` or cache directives `private`, `no-store`, or `no-cache` are not stored. `Cache-Control: max-age` is used when present; otherwise the default TTL is used. |
+| Cache rules | Only eligible `GET` responses with status `200` are considered. Requests carrying `Cookie` or `Authorization` bypass the shared cache; responses with `Set-Cookie`, `Vary`, or `private`, `no-store`, or `no-cache` directives are not stored. `Cache-Control: max-age` is used when present; otherwise the default TTL is used. |
 | Domain blocking | Reads domains from `blocked_domains.txt`; a listed domain and its subdomains are blocked with `403 Forbidden`. |
 | Concurrent clients | Starts a separate daemon thread for each accepted client connection. |
 | Request validation | Checks the request line and headers, and applies header/body size limits. |
@@ -176,6 +176,10 @@ A listed domain blocks that domain and subdomains of it; for example, `example.c
 
 `proxy_logger.py` writes timestamped events to `proxy.log` and, by default, to the terminal. Logged information includes client address, request method, destination, response status, cache status, elapsed time, bytes recorded by the handler, blocked requests, upstream failures, and CONNECT tunnel establishment. On `Ctrl+C`, the server closes its listening socket and prints counters for total requests, bytes, blocked requests, cache hits/misses, cache hit rate, and errors.
 
+## Cache-leak vulnerability and fix
+
+The original shared-cache policy keyed entries by destination and request target, so it could treat two clients’ requests as equivalent even when their cookies or authorization differed. That could expose a personalized response cached for one client to another. The cache policy was tightened to bypass cache lookup and storage for requests carrying `Cookie` or `Authorization`, and to reject responses containing `Set-Cookie` or `Vary` or marked `private`, `no-store`, or `no-cache`. This is a conservative safeguard for this project; it is not a complete implementation of all HTTP cache semantics.
+
 ## Current limitations
 
 - **No rate limiting:** this code implements domain blocking, not per-IP request limits.
@@ -184,7 +188,7 @@ A listed domain blocks that domain and subdomains of it; for example, `example.c
 - **One request per client connection:** the proxy forwards `Connection: close`; persistent HTTP keep-alive is not implemented.
 - **HTTPS is opaque:** the proxy sees the `CONNECT` destination and can block that domain, but TLS payloads are not decrypted, cached, or filtered by URL.
 - **Memory-only cache:** cache entries are lost when the server exits; there is no disk cache or conditional revalidation using ETag.
-- **Basic cache policy:** only eligible status-200 GET responses are stored; the cache does not implement the full HTTP `Vary` model.
+- **Basic cache policy:** responses with `Vary` are excluded rather than cached using the full HTTP `Vary` model; conditional revalidation is not implemented.
 - **Thread-per-connection model:** suitable for a small educational project, but not designed as a production proxy for very high connection counts.
 - **No proxy authentication:** the default listener is on loopback (`127.0.0.1`).
 

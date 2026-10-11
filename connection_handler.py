@@ -399,10 +399,22 @@ def handle_client(client_socket, client_addr, cache):
 
         # Include the host in the cache key.
         cache_key = f"{host_header.lower()}|{target}"
+
+        # Do not use the shared cache for authenticated requests.
+        has_auth_headers = (
+            "cookie" in headers or "authorization" in headers
+        )
+        cache_allowed = method == "GET" and not has_auth_headers
         cache_status = "SKIP"
 
-        # Only GET requests use the cache.
-        if method == "GET":
+        if method == "GET" and has_auth_headers:
+            proxy_logger.log_info(
+                f"CACHE_BYPASS | reason=authenticated_request | "
+                f"destination={destination}"
+            )
+
+        # Only public GET requests without credentials use the cache.
+        if cache_allowed:
             cached_response = cache.get(cache_key)
 
             if cached_response is not None:
@@ -528,8 +540,8 @@ def handle_client(client_socket, client_addr, cache):
             )
             return
 
-        # Store responses allowed by the cache policy.
-        if method == "GET":
+        # Store responses only for requests allowed to use the cache.
+        if cache_allowed:
             ttl = get_cache_ttl(response)
 
             if ttl is not None and ttl > 0:
