@@ -1,8 +1,10 @@
 
 import socket
 import select
+import time
 
 from access_control import is_blocked
+from proxy_logger import proxy_logger
 
 from http_parser import (
     parse_request,
@@ -11,24 +13,14 @@ from http_parser import (
 )
 
 
-MAX_HEADER_SIZE = 64 * 1024       # 64 KiB
-MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MiB
-CLIENT_READ_TIMEOUT = 10           # Seconds
+MAX_HEADER_SIZE = 64 * 1024
+MAX_BODY_SIZE = 10 * 1024 * 1024
+CLIENT_READ_TIMEOUT = 10
 
 
 def read_client_request(client_socket):
-    """
-    Read one complete HTTP request.
+    """Read complete HTTP headers and the declared request body."""
 
-    Supports headers followed by a body framed using Content-Length.
-    Chunked request bodies are explicitly rejected because they are
-    not decoded or forwarded by this implementation.
-
-    Returns:
-        (request_bytes, None) on success.
-        (None, HTTP_status_code) on a request-reading error.
-        (b"", None) if the client closes without sending data.
-    """
     data = bytearray()
     separator = b"\r\n\r\n"
 
@@ -36,7 +28,7 @@ def read_client_request(client_socket):
     client_socket.settimeout(CLIENT_READ_TIMEOUT)
 
     try:
-        # Read until the entire HTTP header section arrives.
+        # Read until all headers have arrived.
         while separator not in data:
             try:
                 chunk = client_socket.recv(4096)
@@ -58,11 +50,11 @@ def read_client_request(client_socket):
         if header_end > MAX_HEADER_SIZE:
             return None, 431
 
-        # Inspect framing headers without modifying the original request.
         header_text = bytes(data[:header_end]).decode("iso-8859-1")
         header_lines = header_text.split("\r\n")
         framing_headers = {}
 
+        # Read Content-Length and Transfer-Encoding.
         for line in header_lines[1:]:
             if not line:
                 break
@@ -77,8 +69,6 @@ def read_client_request(client_socket):
             if not name:
                 return None, 400
 
-            # Conflicting Content-Length or Transfer-Encoding values
-            # can lead to ambiguous request framing, so reject them.
             if name in ("content-length", "transfer-encoding"):
                 if (
                     name in framing_headers
@@ -88,35 +78,32 @@ def read_client_request(client_socket):
 
                 framing_headers[name] = value
 
-        # Reject ambiguous framing when both headers are present.
+        # Reject conflicting request-framing headers.
         if (
             "content-length" in framing_headers
             and "transfer-encoding" in framing_headers
         ):
             return None, 400
 
-        # Chunked request bodies are not supported in this version.
+        # Chunked request bodies are not supported yet.
         if "transfer-encoding" in framing_headers:
             return None, 501
 
-        content_length_text = framing_headers.get("content-length", "0")
+        length_text = framing_headers.get("content-length", "0")
 
-        if not content_length_text or not all(
-            "0" <= char <= "9" for char in content_length_text
+        if not length_text or not all(
+            "0" <= char <= "9" for char in length_text
         ):
             return None, 400
 
-        try:
-            content_length = int(content_length_text)
-        except ValueError:
-            return None, 400
+        content_length = int(length_text)
 
         if content_length > MAX_BODY_SIZE:
             return None, 413
 
         expected_length = header_end + content_length
 
-        # Continue reading until the complete declared body arrives.
+        # Wait for the complete declared body.
         while len(data) < expected_length:
             try:
                 chunk = client_socket.recv(4096)
@@ -124,43 +111,66 @@ def read_client_request(client_socket):
                 return None, 408
 
             if not chunk:
-                # The client closed the connection before the
-                # declared body was completely received.
                 return None, 400
 
             data.extend(chunk)
 
-        # This handler processes one request per connection. Ignore
-        # any bytes beyond this request's declared body.
+        # This proxy handles one request per connection.
         return bytes(data[:expected_length]), None
 
     finally:
-        # Restore the socket's original timeout. In particular, this
-        # prevents the request-reading timeout from affecting CONNECT.
         try:
             client_socket.settimeout(original_timeout)
         except OSError:
             pass
 
 
+def get_response_status(response):
+    """Extract the status code from an HTTP response."""
+
+    try:
+        status_line = response.split(b"\r\n", 1)[0]
+        parts = status_line.split()
+        return int(parts[1])
+    except (IndexError, ValueError):
+        return 502
+
+
+def get_log_destination(target, host_header=None):
+    """Build a readable destination for the traffic log."""
+
+    if target.startswith(("http://", "https://")):
+        return target
+
+    if host_header:
+        if not target.startswith("/"):
+            target = "/" + target
+
+        return f"http://{host_header}{target}"
+
+    return target
+
+
 def tunnel(client_socket, server_socket):
-    """Relay bytes between a client and an upstream server."""
+    """Relay data between a client and an HTTPS server."""
+
     sockets = [client_socket, server_socket]
+    bytes_transferred = 0
 
     while True:
         try:
             readable, _, _ = select.select(sockets, [], [])
         except (OSError, ValueError):
-            return
+            return bytes_transferred
 
         for sock in readable:
             try:
                 data = sock.recv(4096)
             except (ConnectionAbortedError, ConnectionResetError, OSError):
-                return
+                return bytes_transferred
 
             if not data:
-                return
+                return bytes_transferred
 
             other = (
                 server_socket
@@ -170,17 +180,23 @@ def tunnel(client_socket, server_socket):
 
             try:
                 other.sendall(data)
+                bytes_transferred += len(data)
             except (ConnectionAbortedError, ConnectionResetError, OSError):
-                return
+                return bytes_transferred
 
 
 def handle_client(client_socket, client_addr, cache):
-    """Handle one client request and close the connection safely."""
+    """Handle one client connection and log its outcome."""
+
     server_socket = None
+    start_time = time.perf_counter()
+
+    method = "UNKNOWN"
+    target = "-"
+    destination = "-"
 
     try:
-        # Read a complete request instead of assuming one recv()
-        # contains the entire request.
+        # Read the entire request before parsing it.
         data, read_error = read_client_request(client_socket)
 
         if read_error is not None:
@@ -199,24 +215,44 @@ def handle_client(client_socket, client_addr, cache):
                 "Connection: close\r\n"
                 "Content-Length: 0\r\n\r\n".encode("ascii")
             )
+
+            proxy_logger.log_error(
+                client_addr,
+                method,
+                target,
+                f"HTTP {read_error}: {reason}",
+            )
             return
 
         if not data:
             return
 
-        # Parse the complete request and reject malformed input.
         parsed_request = parse_request(data)
 
         if parsed_request is None:
             client_socket.sendall(
                 b"HTTP/1.1 400 Bad Request\r\n"
-                b"Connection: close\r\n\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+
+            proxy_logger.log_error(
+                client_addr,
+                method,
+                target,
+                "HTTP 400: malformed request",
             )
             return
 
         method, target, version, headers = parsed_request
 
-        print(f"{client_addr} -> {method} {target}")
+        host_header = headers.get("host")
+        destination = get_log_destination(target, host_header)
+
+        proxy_logger.log_info(
+            f"REQUEST_RECEIVED | client={client_addr} | "
+            f"method={method} | destination={destination}"
+        )
 
         # Handle HTTPS CONNECT requests.
         if method == "CONNECT":
@@ -224,6 +260,11 @@ def handle_client(client_socket, client_addr, cache):
                 client_socket.sendall(
                     b"HTTP/1.1 400 Bad Request\r\n"
                     b"Connection: close\r\n\r\n"
+                )
+
+                proxy_logger.log_error(
+                    client_addr, method, target,
+                    "HTTP 400: invalid CONNECT destination",
                 )
                 return
 
@@ -234,6 +275,11 @@ def handle_client(client_socket, client_addr, cache):
                     b"HTTP/1.1 400 Bad Request\r\n"
                     b"Connection: close\r\n\r\n"
                 )
+
+                proxy_logger.log_error(
+                    client_addr, method, target,
+                    "HTTP 400: invalid CONNECT port",
+                )
                 return
 
             port = int(port_text)
@@ -243,13 +289,24 @@ def handle_client(client_socket, client_addr, cache):
                     b"HTTP/1.1 400 Bad Request\r\n"
                     b"Connection: close\r\n\r\n"
                 )
+
+                proxy_logger.log_error(
+                    client_addr, method, target,
+                    "HTTP 400: CONNECT port out of range",
+                )
                 return
 
             if is_blocked(host):
-                print(f"BLOCKED: {host}")
                 client_socket.sendall(
                     b"HTTP/1.1 403 Forbidden\r\n"
                     b"Connection: close\r\n\r\n"
+                )
+
+                proxy_logger.log_blocked(
+                    client_addr,
+                    method,
+                    target,
+                    "HTTP 403: destination blocked",
                 )
                 return
 
@@ -258,23 +315,25 @@ def handle_client(client_socket, client_addr, cache):
                     (host, port), timeout=10
                 )
             except socket.timeout as error:
-                print(
-                    f"Upstream connection timed out for {host}:{port}: "
-                    f"{error}"
-                )
                 client_socket.sendall(
                     b"HTTP/1.1 504 Gateway Timeout\r\n"
                     b"Connection: close\r\n\r\n"
                 )
+
+                proxy_logger.log_error(
+                    client_addr, method, target,
+                    f"HTTP 504: upstream timeout: {error}",
+                )
                 return
             except OSError as error:
-                print(
-                    f"Upstream connection failed for {host}:{port}: "
-                    f"{type(error).__name__}: {error}"
-                )
                 client_socket.sendall(
                     b"HTTP/1.1 502 Bad Gateway\r\n"
                     b"Connection: close\r\n\r\n"
+                )
+
+                proxy_logger.log_error(
+                    client_addr, method, target,
+                    f"HTTP 502: upstream connection failed: {error}",
                 )
                 return
 
@@ -282,19 +341,40 @@ def handle_client(client_socket, client_addr, cache):
                 b"HTTP/1.1 200 Connection Established\r\n\r\n"
             )
 
-            tunnel(client_socket, server_socket)
+            proxy_logger.log_tunnel(client_addr, host, port)
+
+            # Keep track of the bytes relayed in both directions.
+            bytes_transferred = tunnel(client_socket, server_socket)
+
+            response_time_ms = (
+                time.perf_counter() - start_time
+            ) * 1000
+
+            proxy_logger.log_request(
+                client_addr,
+                method,
+                target,
+                200,
+                "N/A",
+                response_time_ms,
+                bytes_transferred,
+            )
             return
 
-        # Check the Host header for ordinary HTTP requests.
-        host_header = headers.get("host")
-
+        # Ordinary HTTP requests require a Host header.
         if not host_header:
             client_socket.sendall(
                 b"HTTP/1.1 400 Bad Request\r\n"
                 b"Connection: close\r\n\r\n"
             )
+
+            proxy_logger.log_error(
+                client_addr, method, destination,
+                "HTTP 400: missing Host header",
+            )
             return
 
+        # Check whether the destination is blocked.
         blocked_host = host_header
 
         if ":" in blocked_host:
@@ -304,28 +384,56 @@ def handle_client(client_socket, client_addr, cache):
                 blocked_host = possible_host
 
         if is_blocked(blocked_host):
-            print(f"BLOCKED: {blocked_host}")
             client_socket.sendall(
                 b"HTTP/1.1 403 Forbidden\r\n"
                 b"Connection: close\r\n\r\n"
+            )
+
+            proxy_logger.log_blocked(
+                client_addr,
+                method,
+                destination,
+                "HTTP 403: destination blocked",
             )
             return
 
         # Include the host in the cache key.
         cache_key = f"{host_header.lower()}|{target}"
+        cache_status = "SKIP"
 
-        # Only GET requests are eligible for cache lookup.
+        # Only GET requests use the cache.
         if method == "GET":
             cached_response = cache.get(cache_key)
 
             if cached_response is not None:
-                print(f"CACHE HIT: {target}")
                 client_socket.sendall(cached_response)
+
+                response_time_ms = (
+                    time.perf_counter() - start_time
+                ) * 1000
+
+                proxy_logger.log_info(
+                    f"CACHE_HIT | destination={destination}"
+                )
+
+                proxy_logger.log_request(
+                    client_addr,
+                    method,
+                    destination,
+                    get_response_status(cached_response),
+                    "HIT",
+                    response_time_ms,
+                    len(cached_response),
+                )
                 return
 
-            print(f"CACHE MISS: {target}")
+            cache_status = "MISS"
 
-        # Determine the upstream host and port.
+            proxy_logger.log_info(
+                f"CACHE_MISS | destination={destination}"
+            )
+
+        # Find the upstream host and port.
         host = host_header
         port = 80
 
@@ -341,31 +449,38 @@ def handle_client(client_socket, client_addr, cache):
                 b"HTTP/1.1 400 Bad Request\r\n"
                 b"Connection: close\r\n\r\n"
             )
+
+            proxy_logger.log_error(
+                client_addr, method, destination,
+                "HTTP 400: invalid upstream port",
+            )
             return
 
-        # Connect to the origin server.
+        # Connect to the destination server.
         try:
             server_socket = socket.create_connection(
                 (host, port), timeout=10
             )
         except socket.timeout as error:
-            print(
-                f"Upstream connection timed out for {host}:{port}: "
-                f"{error}"
-            )
             client_socket.sendall(
                 b"HTTP/1.1 504 Gateway Timeout\r\n"
                 b"Connection: close\r\n\r\n"
             )
+
+            proxy_logger.log_error(
+                client_addr, method, destination,
+                f"HTTP 504: upstream timeout: {error}",
+            )
             return
         except OSError as error:
-            print(
-                f"Upstream connection failed for {host}:{port}: "
-                f"{type(error).__name__}: {error}"
-            )
             client_socket.sendall(
                 b"HTTP/1.1 502 Bad Gateway\r\n"
                 b"Connection: close\r\n\r\n"
+            )
+
+            proxy_logger.log_error(
+                client_addr, method, destination,
+                f"HTTP 502: upstream connection failed: {error}",
             )
             return
 
@@ -376,8 +491,7 @@ def handle_client(client_socket, client_addr, cache):
         )
         server_socket.sendall(forwarded_request)
 
-        # Read the upstream response until the origin closes the
-        # connection, as in the original implementation.
+        # Read the upstream response.
         response_parts = []
 
         while True:
@@ -387,6 +501,11 @@ def handle_client(client_socket, client_addr, cache):
                 client_socket.sendall(
                     b"HTTP/1.1 504 Gateway Timeout\r\n"
                     b"Connection: close\r\n\r\n"
+                )
+
+                proxy_logger.log_error(
+                    client_addr, method, destination,
+                    "HTTP 504: timeout while reading upstream response",
                 )
                 return
 
@@ -398,24 +517,46 @@ def handle_client(client_socket, client_addr, cache):
         response = b"".join(response_parts)
 
         if not response:
+            client_socket.sendall(
+                b"HTTP/1.1 502 Bad Gateway\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+
+            proxy_logger.log_error(
+                client_addr, method, destination,
+                "HTTP 502: empty upstream response",
+            )
             return
 
-        # Store eligible GET responses in the cache.
+        # Store responses allowed by the cache policy.
         if method == "GET":
             ttl = get_cache_ttl(response)
 
             if ttl is not None and ttl > 0:
                 cache.put(cache_key, response, ttl)
-                print(f"CACHE STORED: {target}")
 
+                proxy_logger.log_info(
+                    f"CACHE_STORED | destination={destination}"
+                )
+
+        # Send the response before logging successful completion.
         client_socket.sendall(response)
 
-    except (OSError, ValueError, IndexError) as error:
-        print(
-            f"Proxy error for {client_addr}: "
-            f"{type(error).__name__}: {error}"
+        response_time_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        proxy_logger.log_request(
+            client_addr,
+            method,
+            destination,
+            get_response_status(response),
+            cache_status,
+            response_time_ms,
+            len(response),
         )
 
+    except (OSError, ValueError, IndexError) as error:
         try:
             client_socket.sendall(
                 b"HTTP/1.1 502 Bad Gateway\r\n"
@@ -423,6 +564,13 @@ def handle_client(client_socket, client_addr, cache):
             )
         except OSError:
             pass
+
+        proxy_logger.log_error(
+            client_addr,
+            method,
+            destination,
+            f"Unexpected proxy error: {error}",
+        )
 
     finally:
         if server_socket is not None:
