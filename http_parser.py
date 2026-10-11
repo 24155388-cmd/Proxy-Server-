@@ -94,8 +94,17 @@ def get_cache_ttl(response):
             key = key.lower().strip()
             headers[key] = headers.get(key, "") + "," + value.strip()
 
-    # Do not cache responses that set cookies or vary by request headers.
-    if "set-cookie" in headers or "vary" in headers:
+    # Never cache responses that set cookies. This proxy supports
+    # Vary: Accept-Encoding because the cache key includes that request header.
+    if "set-cookie" in headers:
+        return None
+
+    vary_headers = {
+        item.strip()
+        for item in headers.get("vary", "").split(",")
+        if item.strip()
+    }
+    if "*" in vary_headers or not vary_headers.issubset({"accept-encoding"}):
         return None
 
     cache_control = headers.get("cache-control", "").lower()

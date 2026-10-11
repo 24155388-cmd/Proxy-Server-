@@ -185,6 +185,75 @@ def tunnel(client_socket, server_socket):
                 return bytes_transferred
 
 
+
+def _receive_response(server_socket, request_method):
+    """Read one complete HTTP response using its framing headers."""
+    server_socket.settimeout(10)
+    data = bytearray()
+    separator = b"\r\n\r\n"
+
+    # Read the complete response headers first.
+    while separator not in data:
+        chunk = server_socket.recv(4096)
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+
+    header_end = data.index(separator) + len(separator)
+    header_text = bytes(data[:header_end]).decode("iso-8859-1").lower()
+    status_line = header_text.split("\r\n", 1)[0].split()
+
+    try:
+        status_code = int(status_line[1])
+    except (IndexError, ValueError):
+        return bytes(data)
+
+    # These responses do not contain a message body.
+    if request_method == "HEAD" or 100 <= status_code < 200 or status_code in (204, 304):
+        return bytes(data)
+
+    content_length = None
+    is_chunked = False
+
+    for line in header_text.split("\r\n")[1:]:
+        if line.startswith("content-length:"):
+            try:
+                content_length = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                content_length = None
+        elif line.startswith("transfer-encoding:") and "chunked" in line:
+            is_chunked = True
+
+    if is_chunked:
+        # Read through the terminating zero-sized chunk.
+        while not data.endswith(b"0\r\n\r\n"):
+            chunk = server_socket.recv(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+
+    elif content_length is not None:
+        expected_length = header_end + content_length
+        while len(data) < expected_length:
+            chunk = server_socket.recv(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+        # Do not wait for the origin to close after the full body arrives.
+        if len(data) > expected_length:
+            del data[expected_length:]
+
+    else:
+        # No explicit body length: the response ends when the server closes.
+        while True:
+            chunk = server_socket.recv(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+
+    return bytes(data)
+
+
 def handle_client(client_socket, client_addr, cache):
     """Handle one client connection and log its outcome."""
 
@@ -398,20 +467,43 @@ def handle_client(client_socket, client_addr, cache):
             return
 
         # Include the host in the cache key.
-        cache_key = f"{host_header.lower()}|{target}"
+        # Keep representations selected by Accept-Encoding in separate cache entries.
+        accept_encoding = headers.get("accept-encoding", "")
+        cache_key = (
+            f"{host_header.lower()}|{target}|accept-encoding={accept_encoding}"
+        )
 
-        # Do not use the shared cache for authenticated requests.
+        
+        # Do not use the shared cache for authenticated or
+        # explicitly non-cacheable client requests.
         has_auth_headers = (
             "cookie" in headers or "authorization" in headers
         )
-        cache_allowed = method == "GET" and not has_auth_headers
+
+        request_cache_control = headers.get("cache-control", "").lower()
+        request_directives = {
+            item.strip().split("=", 1)[0]
+            for item in request_cache_control.split(",")
+        }
+
+        bypass_requested = (
+            bool(request_directives.intersection({"no-cache", "no-store"}))
+            or headers.get("pragma", "").lower().strip() == "no-cache"
+        )
+
+        cache_allowed = (
+            method == "GET"
+            and not has_auth_headers
+            and not bypass_requested
+        )
         cache_status = "SKIP"
 
-        if method == "GET" and has_auth_headers:
+        if method == "GET" and (has_auth_headers or bypass_requested):
             proxy_logger.log_info(
-                f"CACHE_BYPASS | reason=authenticated_request | "
+                f"CACHE_BYPASS | reason=client_request_policy | "
                 f"destination={destination}"
             )
+
 
         # Only public GET requests without credentials use the cache.
         if cache_allowed:
@@ -503,30 +595,21 @@ def handle_client(client_socket, client_addr, cache):
         )
         server_socket.sendall(forwarded_request)
 
-        # Read the upstream response.
-        response_parts = []
+        # Read the response according to HTTP framing (Content-Length,
+        # chunked transfer encoding, or connection close).
+        try:
+            response = _receive_response(server_socket, method)
+        except socket.timeout:
+            client_socket.sendall(
+                b"HTTP/1.1 504 Gateway Timeout\r\n"
+                b"Connection: close\r\n\r\n"
+            )
 
-        while True:
-            try:
-                chunk = server_socket.recv(4096)
-            except socket.timeout:
-                client_socket.sendall(
-                    b"HTTP/1.1 504 Gateway Timeout\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
-
-                proxy_logger.log_error(
-                    client_addr, method, destination,
-                    "HTTP 504: timeout while reading upstream response",
-                )
-                return
-
-            if not chunk:
-                break
-
-            response_parts.append(chunk)
-
-        response = b"".join(response_parts)
+            proxy_logger.log_error(
+                client_addr, method, destination,
+                "HTTP 504: timeout while reading upstream response",
+            )
+            return
 
         if not response:
             client_socket.sendall(
