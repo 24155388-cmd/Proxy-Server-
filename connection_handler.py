@@ -21,6 +21,7 @@ CLIENT_READ_TIMEOUT = 10
 def read_client_request(client_socket):
     """Read complete HTTP headers and the declared request body."""
 
+    # A bytearray stores bytes and can be extended as more data arrives.
     data = bytearray()
     separator = b"\r\n\r\n"
 
@@ -38,18 +39,21 @@ def read_client_request(client_socket):
             if not chunk:
                 if not data:
                     return b"", None
-                return None, 400
-
+                return None, 400 # malformed or incomplete request 
+            
             data.extend(chunk)
 
+            # if max_header_size limit exceeded
             if separator not in data and len(data) > MAX_HEADER_SIZE:
                 return None, 431
+
 
         header_end = data.index(separator) + len(separator)
 
         if header_end > MAX_HEADER_SIZE:
             return None, 431
 
+        # decode the header 
         header_text = bytes(data[:header_end]).decode("iso-8859-1")
         header_lines = header_text.split("\r\n")
         framing_headers = {}

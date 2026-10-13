@@ -4,6 +4,7 @@ from collections import OrderedDict
 
 
 class CacheEntry:
+    # Stores a cached response along with its creation time and expiration duration.
     def __init__(self, url, response_data, ttl):
         self.url = url
         self.response_data = response_data
@@ -16,6 +17,7 @@ class CacheEntry:
 
 
 class LRUCache:
+
     def __init__(self, max_entries=100, default_ttl=300):
         self._store = OrderedDict()
         self._max_entries = max_entries
@@ -26,7 +28,9 @@ class LRUCache:
         self.total_misses = 0
 
     def get(self, url):
+        
         with self._lock:
+
             entry = self._store.get(url)
 
             if entry is None:
@@ -40,6 +44,7 @@ class LRUCache:
 
             self._store.move_to_end(url)
             self.total_hits += 1
+
             return entry.response_data
 
     def put(self, url, response_data, ttl=None):
@@ -50,11 +55,12 @@ class LRUCache:
             return
 
         with self._lock:
+
             self._store.pop(url, None)
 
             while len(self._store) >= self._max_entries:
                 self._store.popitem(last=False)
-
+            # store the url 
             self._store[url] = CacheEntry(
                 url, response_data, ttl
             )
