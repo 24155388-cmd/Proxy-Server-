@@ -20,6 +20,16 @@ class ProxyServer:
             default_ttl=config.CACHE_DEFAULT_TTL,
         )
 
+    def show_welcome_screen(self):
+        print("\n" + "=" * 50)
+        print("             PYTHON PROXY SERVER")
+        print("=" * 50)
+        print(f"  Host       : {self.host}")
+        print(f"  Port       : {self.port}")
+        print("  Cache      : LRU")
+        print("  Status     : STARTING...")
+        print("=" * 50 + "\n")
+
     def start(self):
         server_socket = socket.socket(
             socket.AF_INET,
@@ -34,6 +44,9 @@ class ProxyServer:
 
         # Wake up from accept() periodically so shutdown can be handled.
         server_socket.settimeout(1.0)
+
+        # Display welcome screen before starting the server.
+        self.show_welcome_screen()
 
         try:
             server_socket.bind((self.host, self.port))
