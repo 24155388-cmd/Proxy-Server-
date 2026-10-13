@@ -3,3 +3,5 @@
 # One domain per line
 
 example.com
+
+facebook.com
